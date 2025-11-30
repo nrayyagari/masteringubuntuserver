@@ -186,23 +186,135 @@ When you access `/home/alice/file1.txt`:
 7. Reads inode 1001 (file metadata)
 8. Uses block_pointers to fetch actual data from disk
 
-### Viewing Inode Information
+### Viewing Inode Information: Comprehensive Methods
 
+#### **1. `ls -i` — Quick View**
 ```bash
-# See inode number and file info
 ls -i /home/user/file.txt
 1048576 /home/user/file.txt
+```
+**Use**: Fast inode number lookup. Add `-l` for detailed view:
+```bash
+ls -il /home/user/
+total 40
+1048576 -rw-r--r-- 1 user user 4096 Jan 15 10:30 file.txt
+1048577 -rw-r--r-- 1 user user 2048 Jan 20 14:22 doc.pdf
+```
 
-# Get detailed inode data
+#### **2. `stat` — Complete Metadata**
+```bash
 stat /home/user/file.txt
   File: /home/user/file.txt
-  Inode: 1048576
-  Links: 1
-  Access: (0644/-rw-r--r--)
-  Uid: ( 1000/user)  Gid: ( 1000/user)
-  Size: 4096
-  Blocks: 8
+  Size: 4096      Blocks: 8          IO Block: 4096   regular file
+  Device: 801h/2049d  Inode: 1048576   Links: 1
+  Access: (0644/-rw-r--r--)  Uid: ( 1000/   user)   Gid: ( 1000/   user)
+  Access: 2024-11-30 16:45:00.000000000 +0000
+  Modify: 2024-01-20 14:22:00.000000000 +0000
+  Change: 2024-01-15 10:30:00.000000000 +0000
 ```
+**Use**: Full inode data, timestamps, link count, block info.
+
+#### **3. `stat -c` — Custom Output Format**
+```bash
+# Just inode number
+stat -c %i /home/user/file.txt
+1048576
+
+# Inode + filename + link count
+stat -c "%i %n (links: %h)" /home/user/*
+1048576 file.txt (links: 1)
+1048577 doc.pdf (links: 2)
+
+# All inodes in directory
+find /home/user -printf "%i %p\n"
+1048576 /home/user/file.txt
+1048577 /home/user/doc.pdf
+```
+**Use**: Scripting, parsing inode data programmatically.
+
+#### **4. `df -i` — Filesystem Inode Usage (Production Critical)**
+```bash
+df -i /var
+Filesystem     Inodes  IUsed   IFree IUse%
+/dev/sda2    1000000 999999      1  100%
+```
+**Use at 2AM**: Diagnose "No space left on device" errors. Shows inode exhaustion vs. byte exhaustion.
+
+#### **5. `find -inum` — Locate Files by Inode**
+```bash
+# Find file by inode number
+find /home -inum 1048576
+/home/user/file.txt
+
+# Find hard links (same inode)
+find /var -inum 1048576
+/var/backups/file.txt    ← Same inode = hard link
+/var/archive/file.txt    ← Same inode = hard link
+```
+**Use**: Locate hard links or find which files share an inode.
+
+#### **6. `tune2fs -l` — ext4 Filesystem Inode Table Info**
+```bash
+tune2fs -l /dev/sda1 | grep -i inode
+Inode count: 1024000
+Free inodes: 950000
+Inode size: 256
+Inode blocks per group: 64
+```
+**Use**: Filesystem-level inode statistics, inode table size limits.
+
+#### **7. `debugfs` — Low-Level Filesystem Inspection**
+```bash
+# Interactive mode (requires root, filesystem unmounted/read-only)
+debugfs /dev/sda1
+debugfs: stat <1048576>
+  Inode: 1048576   Type: regular    Mode:  0644   Flags: 0x80000
+  User:   1000   Group:  1000
+  Size: 4096
+  Links: 1   Blockcount: 8
+  ctime: 0x65a4f400 -- Mon Jan 15 10:30:00 2024
+  atime: 0x6758a6a0 -- Sat Nov 30 16:45:00 2024
+  mtime: 0x65a8e580 -- Fri Jan 20 14:22:00 2024
+
+debugfs: quit
+```
+**Use**: Deep filesystem debugging, forensics, inspect raw inode data.
+
+#### **8. `lsof` — Open Files by Inode**
+```bash
+# See which processes have files open
+lsof /home/user/file.txt
+COMMAND    PID USER   FD   TYPE DEVICE SIZE NODE NAME
+python3   1234 user    3r  REG  8,1 4096 1048576 /home/user/file.txt
+```
+**Use at 2AM**: File is locked/in use. Find which process holds it.
+
+#### **9. `find` — Bulk Inode Operations**
+```bash
+# Find all files with specific link count (hard links)
+find /data -type f -links +1
+/data/backup/file.txt      ← More than 1 link (hard link exists)
+/data/file.txt
+
+# Find recently changed inodes (ctime)
+find /var/log -type f -cmin -5
+/var/log/syslog           ← Changed in last 5 minutes
+
+# Sort files by inode number
+find /home -printf "%i %p\n" | sort -n
+```
+
+### Quick Reference: Which Tool When?
+
+| Scenario | Tool | Example |
+|----------|------|---------|
+| **"Disk full but space available"** | `df -i` | Shows if inodes exhausted |
+| **"Find hard link copies"** | `find -inum` | Locate all copies of inode |
+| **"Which process uses file?"** | `lsof` | File locked, can't delete |
+| **"Filesystem inode limits"** | `tune2fs -l` | Check inode table size |
+| **"Verify hard link chain"** | `stat -c %h` | Show link count per file |
+| **"Deep filesystem corruption"** | `debugfs stat` | Inspect raw inode data |
+| **"Find all hard links"** | `find -links +1` | Identify duplicated inodes |
 
 ### The Block Pointers
 
