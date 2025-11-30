@@ -632,6 +632,232 @@ ln -s /etc/myapp/config.ini /usr/share/myapp/config.ini
 
 ---
 
+---
+
+## /etc vs /home: System-Wide vs User-Specific Configuration
+
+### /etc: System-Wide Application Configuration
+
+All system applications store their configuration files in `/etc`. This is managed by the system administrator (root), not individual users.
+
+```bash
+/etc/
+├── nginx/              ← Nginx web server configs
+│   ├── nginx.conf
+│   └── sites-available/
+├── apache2/            ← Apache web server configs
+├── mysql/              ← MySQL database configs
+├── postgresql/         ← PostgreSQL configs
+├── ssh/                ← SSH server configs
+│   └── sshd_config
+├── docker/             ← Docker daemon configs
+├── systemd/            ← System service configs
+├── apt/                ← Package manager (Ubuntu/Debian)
+└── cron.d/             ← Cron job configs
+```
+
+**Key point**: `/etc` is system-wide. Changes affect the entire system for all users.
+
+### /home: User-Specific Directories
+
+Each user has their own home directory under `/home/`.
+
+```bash
+/home/
+├── laborant/           ← User laborant's home
+│   ├── .bashrc         ← User laborant's shell config
+│   ├── .ssh/           ← User laborant's SSH keys
+│   ├── .config/        ← User laborant's app configs
+│   └── Documents/
+├── user2/              ← User2's home
+│   ├── .bashrc         ← User2's shell config (DIFFERENT)
+│   ├── .ssh/
+│   └── .config/
+└── alice/
+```
+
+**Comparison**:
+
+| Aspect | /etc (System-wide) | /home/user (User-specific) |
+|--------|-------------------|--------------------------|
+| **Who manages** | System admin (root) | Individual user |
+| **Affects** | All users | Only that user |
+| **Example** | /etc/nginx/nginx.conf | /home/laborant/.bashrc |
+| **Permissions** | 644 or 755 | 700 (user only) |
+
+---
+
+## / vs /root: NOT the Same
+
+These are **completely different**:
+
+```
+/          ← Root of the ENTIRE filesystem (everything starts here)
+/root/     ← Home directory of the root user (the superuser)
+```
+
+### Filesystem Hierarchy
+
+```
+/ (filesystem root - top of everything)
+├── /bin/               ← System binaries
+├── /etc/               ← Configuration
+├── /home/              ← User home directories
+│   ├── laborant/
+│   └── user2/
+├── /root/              ← ROOT USER's home directory (NOT in /home)
+├── /usr/
+├── /var/
+└── /tmp/
+```
+
+### Key Distinction
+
+| Aspect | / | /root |
+|--------|---|-------|
+| **What is it** | Root of entire filesystem | Home directory of root user |
+| **Represents** | Top of hierarchy (like street level) | A specific directory (like a house) |
+| **Contains** | Everything (bin, etc, home, var, root...) | Root user's files (.bashrc, .ssh, projects) |
+| **Who owns it** | filesystem | root (uid 0) |
+
+**Why /root instead of /home/root?**
+
+By convention, system users (like root) get homes outside /home. Regular users use /home.
+
+---
+
+## FHS: Filesystem Hierarchy Standard
+
+**FHS (Filesystem Hierarchy Standard)** is the POSIX standard that defines how directories should be organized in Linux/Unix systems.
+
+### FHS Directory Structure
+
+```
+/ (root)
+├── /bin/          ← Essential command binaries
+├── /boot/         ← Boot files, kernel
+├── /dev/          ← Device files
+├── /etc/          ← System configuration
+├── /home/         ← User home directories
+├── /lib/          ← System libraries
+├── /mnt/          ← Mount points for filesystems
+├── /opt/          ← Optional software
+├── /proc/         ← Process information
+├── /root/         ← Root user home
+├── /run/          ← Runtime data
+├── /sbin/         ← System binaries (admin only)
+├── /tmp/          ← Temporary files
+├── /usr/          ← User programs and data
+│   ├── /usr/bin/
+│   ├── /usr/lib/
+│   └── /usr/share/
+└── /var/          ← Variable data
+    ├── /var/log/  ← Logs
+    └── /var/cache/
+```
+
+**Why FHS matters**: Ensures consistency across all Linux distributions (Ubuntu, CentOS, Fedora, Debian, etc.). System administrators can navigate any Linux system confidently knowing where to find files.
+
+### FHS vs Other Operating Systems
+
+**Windows**: NO FHS standard. Uses its own structure:
+```
+C:\
+├── Windows\            ← OS system files
+├── Program Files\      ← Applications
+├── Users\              ← User homes
+├── ProgramData\        ← Application data
+└── Temp\               ← Temporary files
+```
+
+**macOS**: Follows FHS (Unix-based) with macOS-specific additions:
+```
+/
+├── /Applications/      ← GUI apps (macOS addition)
+├── /Library/           ← System libraries (macOS addition)
+└── /Users/             ← User homes (like /home)
+```
+
+---
+
+## Directory Link Counts
+
+When you run `stat` on a directory, the `Links` count tells you how many hard links point to that inode.
+
+### How Directory Links Work
+
+For directories, the link count = **2 + number of subdirectories**
+
+Why?
+- **1 link** from `.` (the directory itself)
+- **1 link** from `..` in the directory's parent
+- **1 link** for each subdirectory's `..` (which points back to the parent)
+
+### Example: /var Directory
+
+```bash
+stat /var
+  Links: 11
+  
+Means:
+  1 (from /var itself)
+  1 (from /'s listing)
+  9 (from 9 subdirectories' .. entries pointing back to /var)
+  Total = 11
+```
+
+### Visualizing the Hard Links
+
+```
+/var/ (inode 43717)
+├─ . (inode 43717) → /var itself         = 1 link
+├─ .. (inode X)    → parent (/)          = 1 link
+├─ backups/        → contains: .. (→ inode 43717)  = 1 link
+├─ cache/          → contains: .. (→ inode 43717)  = 1 link
+├─ log/            → contains: .. (→ inode 43717)  = 1 link
+├─ mail/           → contains: .. (→ inode 43717)  = 1 link
+├─ lock/           → contains: .. (→ inode 43717)  = 1 link
+├─ lib/            → contains: .. (→ inode 43717)  = 1 link
+├─ local/          → contains: .. (→ inode 43717)  = 1 link
+├─ spool/          → contains: .. (→ inode 43717)  = 1 link
+└─ tmp/            → contains: .. (→ inode 43717)  = 1 link
+
+Total hard links to inode 43717: 11
+```
+
+### Link Count Formula for Directories
+
+```
+Directory's link_count = 2 + (number of immediate subdirectories)
+
+Example:
+  stat /home
+    Links: 3
+  
+  Means: 2 + 1 subdirectory = 3
+  So /home has 1 subdirectory (probably /home/laborant)
+```
+
+### Automatic Link Count Management
+
+The filesystem automatically manages link counts for directories:
+
+```bash
+# When you create a subdirectory:
+mkdir /var/newdir
+  → /var's link_count increments automatically (11 → 12)
+  → /var/newdir gets .. entry pointing to /var
+
+# When you remove a subdirectory:
+rmdir /var/newdir
+  → /var's link_count decrements automatically (12 → 11)
+  → .. entry removed from /var/newdir
+```
+
+**Key insight**: You never manually manage directory link counts—the filesystem handles this automatically. The link count is just metadata that tells you how many subdirectories exist.
+
+---
+
 ## Key Takeaway
 
-The filesystem is where the rubber meets the road—it's the contract between the application and the hardware. Understand inodes, permissions models, hard links (for deduplication), symlinks (for flexibility), and filesystem design choices, and you'll troubleshoot disk-related issues with confidence. From cross-platform compatibility (case sensitivity, paths) to capacity planning (inode exhaustion) to production deployments (version switching, backups), filesystem knowledge is essential for production systems.
+The filesystem is where the rubber meets the road—it's the contract between the application and the hardware. Understand inodes, permissions models, hard links (for deduplication), symlinks (for flexibility), directory organization (/etc for system configs, /home for users, / vs /root), FHS standards, and filesystem design choices, and you'll troubleshoot disk-related issues with confidence. From cross-platform compatibility to capacity planning to production deployments, filesystem knowledge is essential for production systems.
