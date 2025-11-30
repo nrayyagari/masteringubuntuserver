@@ -119,9 +119,9 @@ inode 12345 {
   size: 4096 bytes
   
   timestamps:
-    created (ctime): 2024-01-15 10:30:00
-    modified (mtime): 2024-01-20 14:22:00
-    accessed (atime): 2024-11-30 16:45:00
+    changed (ctime): 2024-01-15 10:30:00   ← inode metadata change time
+    modified (mtime): 2024-01-20 14:22:00  ← file content modification time
+    accessed (atime): 2024-11-30 16:45:00  ← file access time
   
   link_count: 1
   block_pointers: [87654, 87655, 87656, ...]
@@ -629,8 +629,6 @@ ln -s /etc/myapp/config.ini /usr/share/myapp/config.ini
 | Compiler tools | Hard | Auto-sync all names |
 | Log rotation | Hard | Data survives filename deletion |
 | Config management | Symlink | Enable/disable without deletion |
-
----
 
 ---
 
