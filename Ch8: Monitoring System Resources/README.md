@@ -457,6 +457,85 @@ Yes, nginx workers consuming all CPU
 
 ---
 
+## Tools Summary: What to Use When
+
+### Built-in Tools (Always Available)
+
+| Tool | Command | Use Case |
+|------|---------|----------|
+| uptime | `uptime` | Quick load average check |
+| vmstat | `vmstat 1` | System view with I/O wait, run queue |
+| iostat | `iostat -x 1` | CPU + disk I/O metrics |
+| mpstat | `mpstat -P ALL 1` | **Per-core utilization (CRITICAL)** |
+| ps | `ps aux --sort=-%cpu \| head -6` | Top CPU-consuming processes |
+| top | `top` | Real-time interactive (use mpstat for per-core) |
+| free | `free -h` | Memory usage |
+| df | `df -h` | Disk space |
+
+### Recommended Optional Tools
+
+| Tool | Installation | Use Case | Why Better |
+|------|---|---|---|
+| **htop** | `sudo apt install htop` | Real-time process monitoring | Better UI than top, per-core aware |
+| **btop** | `sudo apt install btop` | Beautiful real-time monitoring | Stunning visuals, intuitive |
+| **glances** | `sudo apt install glances` | All-in-one monitoring | Everything in one tool, web UI available |
+| **dstat** | `sudo apt install dstat` | Colorized real-time stats | Easy to read, configurable columns |
+| **iotop** | `sudo apt install iotop` | Disk I/O by process | Like htop for disk I/O |
+| **nethogs** | `sudo apt install nethogs` | Network usage by process | Like htop for network |
+| **nmon** | `sudo apt install nmon` | Interactive all-in-one | Toggle between CPU/memory/disk/network views |
+
+### Typical Investigation Workflow
+
+```
+System is slow?
+│
+├─ Quick check (30 seconds)
+│  ├─ uptime → Check load / cores
+│  ├─ vmstat 1 → Check %wa (I/O wait)
+│  └─ mpstat -P ALL 1 → Check per-core utilization
+│
+├─ If CPU bottleneck
+│  ├─ ps aux --sort=-%cpu | head -6 → Find CPU hog
+│  └─ htop → Real-time investigation
+│
+├─ If I/O bottleneck
+│  └─ iotop → Find I/O-intensive process
+│
+├─ If Network bottleneck
+│  └─ nethogs → Find network-intensive process
+│
+└─ If everything looks fine
+   └─ Might be application-level issue, check logs/metrics
+```
+
+### Commands Cheat Sheet
+
+**Quick Checks (30 seconds)**:
+```bash
+uptime                           # Load average
+mpstat -P ALL 1                  # Per-core utilization (RUN THIS!)
+vmstat 1                         # System overview with I/O wait
+ps aux --sort=-%cpu | head -6    # Top CPU processes
+free -h                          # Memory
+df -h                            # Disk space
+```
+
+**Interactive Monitoring**:
+```bash
+htop                             # Best balance (need: sudo apt install htop)
+btop                             # Beautiful visuals (need: sudo apt install btop)
+top                              # Built-in, but use htop instead
+```
+
+**Specialized Investigation**:
+```bash
+iotop                            # Disk I/O (needs root: sudo iotop)
+nethogs                          # Network by process (needs root: sudo nethogs)
+iostat -x 1                      # CPU + disk I/O details
+```
+
+---
+
 ## Next Steps
 
 - Learn memory monitoring (RAM, swap, OOM killer)
