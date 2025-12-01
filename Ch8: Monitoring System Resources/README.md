@@ -1073,6 +1073,507 @@ Why different filesystems?
 
 ---
 
+## EBS Volume Management: Attach, Mount, Detach
+
+### The Complete Lifecycle
+
+```
+Attach → Mount → Use → Unmount → Detach
+  (AWS)    (OS)  (Ops)  (OS)     (AWS)
+```
+
+### **Step-by-Step: Adding a Volume to Running Instance**
+
+#### **1. Create Volume**
+```bash
+# From your local machine (AWS CLI)
+$ aws ec2 create-volume \
+    --availability-zone us-east-1a \
+    --size 100 \
+    --volume-type gp3
+# Returns: vol-0987654321
+```
+
+#### **2. Attach Volume (Infrastructure Level)**
+```bash
+# AWS API operation
+$ aws ec2 attach-volume \
+    --volume-id vol-0987654321 \
+    --instance-id i-1234567890abcdef0 \
+    --device /dev/sdf
+
+# Returns: Attachment state "attaching"
+# Wait for state "attached" (usually < 1 second)
+```
+
+**At this point**: Volume is connected, visible as block device, but NOT mounted.
+
+#### **3. SSH Into Instance and Verify**
+```bash
+$ ssh ec2-user@10.0.0.1
+instance$ lsblk
+# NAME          MAJ:MIN RM  SIZE RO TYPE MOUNTPOINTS
+# nvme0n1       259:0    0   30G  0 disk
+# └─nvme0n1p1   259:1    0   30G  0 part /
+# nvme1n1       259:1    0  100G  0 disk          ← Just attached, unformatted
+
+instance$ sudo file -s /dev/nvme1n1
+# /dev/nvme1n1: data (no filesystem)
+```
+
+#### **4. Format the Volume (First Time Only)**
+```bash
+# Initialize filesystem
+instance$ sudo mkfs.ext4 /dev/nvme1n1
+# mke2fs 1.46.2 (28-Feb-2021)
+# Creating filesystem with 26214400 4k blocks...
+# Writing inode tables: done
+# Creating journal: done
+# Writing superblocks and filesystem accounting information: done
+```
+
+#### **5. Create Mount Point**
+```bash
+instance$ sudo mkdir -p /data
+instance$ sudo chown ec2-user:ec2-user /data
+```
+
+#### **6. Mount the Volume**
+```bash
+instance$ sudo mount /dev/nvme1n1 /data
+
+# Verify it's mounted
+instance$ df -h /data
+# Filesystem      Size  Used Avail Use% Mounted on
+# /dev/nvme1n1    100G  100M  100G   1% /data
+
+# Test writing
+instance$ echo "test" > /data/file.txt
+instance$ cat /data/file.txt
+# test ✓
+```
+
+#### **7. Make Persistent (Survives Reboot)**
+```bash
+# Add to /etc/fstab
+instance$ sudo bash -c 'echo "/dev/nvme1n1 /data ext4 defaults,nofail 0 2" >> /etc/fstab'
+
+# Verify it's in fstab
+instance$ grep /dev/nvme1n1 /etc/fstab
+# /dev/nvme1n1 /data ext4 defaults,nofail 0 2
+
+# Test mount (without actual reboot)
+instance$ sudo mount -a  # Should mount without errors
+```
+
+**Explanation of fstab fields**:
+```
+/dev/nvme1n1  /data  ext4  defaults,nofail  0  2
+    |          |      |         |           |  |
+    Device    Mount   FS      Options      |  |
+              Point   Type               Dump Pass
+                                     (backup) (fsck order)
+
+nofail = Don't fail boot if device not found
+```
+
+---
+
+### **Detaching: The Safe Way**
+
+#### **CRITICAL: Unmount BEFORE Detaching**
+
+```bash
+# Inside the instance
+instance$ df -h | grep /data
+# /dev/nvme1n1    100G  100M  100G   1% /data
+
+# Step 1: Unmount first
+instance$ sudo umount /data
+
+# Step 2: Verify it's unmounted
+instance$ df -h
+# (Should NOT see /data)
+
+instance$ lsblk
+# nvme1n1 should no longer show a mount point
+```
+
+#### **Why Unmounting is Critical**
+
+**What happens if you don't unmount**:
+
+```
+Without unmount:
+1. You detach volume while OS thinks filesystem is mounted
+2. OS has buffered writes in memory waiting to flush
+3. OS has open file handles and inodes cached
+4. Sudden disconnection → Filesystem corruption
+5. Result: Data corruption, unrecoverable filesystem
+
+Example disaster:
+$ aws ec2 detach-volume --volume-id vol-123 # While /data is mounted!
+→ Kernel: "What?! The filesystem disappeared!"
+→ Buffered writes lost
+→ Inode cache invalidated
+→ Next mount attempt: "Filesystem has errors, run fsck"
+→ Data loss possible
+```
+
+#### **Correct Detachment**
+
+```bash
+# From your local machine
+$ aws ec2 detach-volume \
+    --volume-id vol-0987654321 \
+    --instance-id i-1234567890abcdef0
+
+# Monitor the detachment
+$ aws ec2 describe-volumes --volume-ids vol-0987654321
+# State should transition: "in-use" → "detaching" → "available"
+
+# Wait for "available" state before reattaching to another instance
+```
+
+#### **Edge Case: Detaching Without Clean Unmount**
+
+**If instance crashed or network disconnected**:
+```bash
+# Can't SSH to unmount, but volume is stuck
+# Option 1: Detach anyway (volume disconnected abruptly)
+aws ec2 detach-volume --force --volume-id vol-123
+
+# Option 2: Reattach to another instance and fsck
+aws ec2 attach-volume --volume-id vol-123 --instance-id i-new
+# In new instance:
+sudo fsck.ext4 /dev/nvme1n1
+# Repairs filesystem consistency
+```
+
+---
+
+## EBS Redundancy vs Backups: The Critical Distinction
+
+### **Understanding EBS Replication (Within AZ)**
+
+EBS volumes are **NOT automatically replicated across multiple AZs**.
+
+```
+CORRECT:
+Availability Zone us-east-1a
+├─ Physical Disk 1: vol-123 data
+├─ Physical Disk 2: vol-123 replica (same AZ, different server)
+└─ Physical Disk 3: vol-123 replica (same AZ, different server)
+
+❌ NOT in us-east-1b or us-east-1c
+```
+
+From AWS documentation: "Volume data is automatically replicated across multiple servers **in an Availability Zone**."
+
+### **What EBS Replication Protects Against**
+
+```
+✓ Single disk failure
+  └─ Kernel reads from replica in same AZ
+  
+✓ Single server failure  
+  └─ EBS auto-failover to another server with data
+  
+✓ Network port failure
+  └─ AWS routes around failed network interface
+  
+Result: Transparent to your application (< 1ms hiccup)
+```
+
+**Automatic recovery**: You don't do anything. EBS handles it.
+
+### **What EBS Replication Does NOT Protect Against**
+
+```
+✗ ENTIRE Availability Zone failure
+  └─ All 3 replicas in that AZ are inaccessible → Volume gone
+  
+✗ Accidental volume deletion
+  $ aws ec2 delete-volume --volume-id vol-123
+  └─ Volume deleted from all replicas → No recovery possible
+  
+✗ Data corruption
+  $ sudo mkfs.ext4 /dev/nvme1n1  # Oops, wrong partition!
+  └─ All 3 replicas formatted → Data lost
+  
+✗ Ransomware
+  $ Attacker encrypts all files on /data
+  └─ All 3 replicas encrypted → Replication doesn't help
+  
+✗ Application bug
+  $ DELETE FROM users WHERE id > 0;  -- Missing WHERE clause!
+  └─ All 3 replicas lose the data → Deletion replicated
+  
+✗ Compliance requirement
+  "Retain backups for 7 years"
+  └─ Replication keeps current state, not historical copies
+```
+
+---
+
+## EBS Snapshots: The Real Disaster Recovery
+
+### **What is a Snapshot?**
+
+A **point-in-time copy** of a volume stored durably in S3 across all AZs.
+
+```
+EBS Volume (within AZ):              Snapshot (across AZs):
+├─ Real-time 3x replication         ├─ Point-in-time copy
+├─ Automatic failover                ├─ Stored in S3 (replicated)
+├─ Protects hardware failure        ├─ Cross-AZ durable
+└─ Can't protect from AZ failure    └─ Can recover to different AZ
+
+When you need recovery:
+├─ Hardware failure: EBS handles (automatic)
+├─ AZ failure: Restore snapshot to another AZ
+├─ Accidental delete: Restore from snapshot
+├─ Data corruption: Restore clean snapshot
+└─ Ransomware: Restore from pre-attack snapshot
+```
+
+### **Creating Snapshots**
+
+```bash
+# Manual snapshot
+$ aws ec2 create-snapshot --volume-id vol-123 \
+    --description "Database backup $(date)"
+# Returns: snap-0987654321
+
+# Check snapshot progress
+$ aws ec2 describe-snapshots --snapshot-ids snap-0987654321
+# Progress: 100%
+# State: completed
+```
+
+### **Automated Snapshot Strategy**
+
+```bash
+# Using AWS Data Lifecycle Manager (preferred)
+$ aws dlm create-lifecycle-policy \
+    --execution-role-arn arn:aws:iam::ACCOUNT:role/service-role/AWSDataLifecycleManagerDefaultRole \
+    --description "Daily database snapshots, retain 7 days" \
+    --state ENABLED \
+    --policy-details file://policy.json
+```
+
+**Policy file (policy.json)**:
+```json
+{
+  "PolicyType": "EBS_SNAPSHOT_MANAGEMENT",
+  "ResourceTypes": ["VOLUME"],
+  "TargetTags": [{"Key": "Backup", "Value": "daily"}],
+  "Schedules": [
+    {
+      "Name": "Daily snapshots at 1 AM",
+      "CreateRule": {
+        "Interval": 24,
+        "IntervalUnit": "HOURS",
+        "Times": ["01:00"]
+      },
+      "RetainRule": {
+        "Count": 7
+      }
+    }
+  ]
+}
+```
+
+**Result**: Automatic daily snapshots, oldest deleted after 7 days.
+
+### **Recovering from Snapshot**
+
+```bash
+# Create new volume from snapshot
+$ aws ec2 create-volume \
+    --snapshot-id snap-0987654321 \
+    --availability-zone us-east-1b  # Different AZ!
+# Returns: vol-new123
+
+# Attach to running instance
+$ aws ec2 attach-volume \
+    --volume-id vol-new123 \
+    --instance-id i-running \
+    --device /dev/sdf
+
+# In instance, mount it
+instance$ sudo mount /dev/nvme1n1 /recovered
+instance$ ls /recovered  # Your data is back!
+```
+
+---
+
+## Production Architecture: Real-World Example
+
+### **Single AZ (Development)**
+
+```
+┌─ Availability Zone us-east-1a ──────────────────┐
+│                                                   │
+│  EC2 Instance (t3.medium)                         │
+│  ├─ Root: gp3 (30GB)                             │
+│  └─ Data: gp3 (100GB)                            │
+│      └─ EBS Replication: 3x copies within AZ    │
+│                                                   │
+│  Manual snapshots: Weekly (retention: 2 weeks)   │
+│                                                   │
+└───────────────────────────────────────────────────┘
+
+Cost: Low
+Availability: 99.5% (AZ failure = downtime)
+Recovery: Manual (hours)
+Use case: Dev/test, non-critical apps
+```
+
+### **Multi-AZ (Production)**
+
+```
+┌─ Primary Region (us-east-1) ──────────────────────────┐
+│                                                        │
+│  ┌─ Availability Zone us-east-1a ────────────────┐   │
+│  │  EC2 Instance (c6i.2xlarge)                    │   │
+│  │  ├─ Root: gp3 (30GB)                           │   │
+│  │  ├─ Data: io2 (500GB, 50,000 IOPS)            │   │
+│  │  │  └─ EBS Replication: 3x within AZ         │   │
+│  │  └─ Backup: gp3 (100GB)                       │   │
+│  └────────────────────────────────────────────────┘   │
+│           ↓ (Every 1 hour)                            │
+│  Snapshot → S3 (durable across all AZs)               │
+│           ↓                                            │
+│  ┌─ Snapshot Storage ─────────────────────────────┐   │
+│  │ Replicated across us-east-1a, us-east-1b,     │   │
+│  │ us-east-1c (available in all AZs)             │   │
+│  │ Retention: 14 days (auto-delete old)          │   │
+│  └────────────────────────────────────────────────┘   │
+│                                                        │
+└────────────────────────────────────────────────────────┘
+          ↓ (Cross-region replication)
+┌─ Secondary Region (us-west-2) ────────────────────────┐
+│  ┌─ Snapshot Copies ──────────────────────────────┐   │
+│  │ For disaster recovery                          │   │
+│  │ Lag: 2-4 hours behind primary                  │   │
+│  │ Retention: 7 days                              │   │
+│  └────────────────────────────────────────────────┘   │
+└────────────────────────────────────────────────────────┘
+
+Failure Scenarios:
+├─ Disk failure (us-east-1a)     → EBS replication handles (instant)
+├─ Server failure (us-east-1a)   → EBS failover (instant)
+├─ AZ failure (us-east-1a)       → Restore snapshot in us-east-1b (5 min)
+├─ Region failure (us-east-1)    → Restore snapshot in us-west-2 (30 min)
+├─ Accidental delete             → Restore from snapshot (5 min)
+├─ Data corruption               → Restore clean snapshot (10 min)
+└─ Ransomware                    → Restore pre-attack snapshot (10 min)
+
+Cost: ~$100-200/month (volumes + snapshots)
+Availability: 99.99%
+Recovery: Automated for hardware, minutes for disaster
+Use case: Production databases, critical systems
+```
+
+### **Enterprise (Multi-Region with Backup Archive)**
+
+```
+┌─ Primary Region (us-east-1) ──────────────────────────┐
+│ Database with io2 Block Express (256K IOPS)           │
+│ Snapshots every 15 minutes → S3                       │
+│ Cross-region to us-west-2 (real-time)                │
+└────────────────────────────────────────────────────────┘
+          ↓ (Hourly)
+┌─ Secondary Region (us-west-2) ────────────────────────┐
+│ Snapshot copies (active DR site)                      │
+│ Can promote to primary if needed                      │
+└────────────────────────────────────────────────────────┘
+          ↓ (Daily)
+┌─ Archive Region (eu-west-1) ──────────────────────────┐
+│ EBS Snapshots Archive (cold storage)                  │
+│ Retention: 7 years (compliance requirement)           │
+│ Cost: ~$0.01 per GB-month (vs $0.05 for normal)      │
+└────────────────────────────────────────────────────────┘
+
+Cost: ~$500-1000/month
+Availability: 99.999%
+Recovery: Seconds (us-west-2), hours (eu-west-1)
+Use case: Financial institutions, healthcare, regulated industries
+```
+
+---
+
+## Backup Strategy by Workload
+
+### **Web Application (gp3, moderate data)**
+
+```
+Backup Schedule:
+├─ Snapshots: Every 6 hours
+├─ Retention: 7 days
+├─ Cross-region: Weekly (to another region)
+└─ Total: ~$20/month for 500GB volume
+
+Rationale:
+├─ RPO (Recovery Point Objective): 6 hours
+├─ RTO (Recovery Time Objective): 15 minutes
+└─ Cost-efficient for non-critical data
+```
+
+### **Production Database (io2, high-value data)**
+
+```
+Backup Schedule:
+├─ Snapshots: Every 1 hour
+├─ Retention: 14 days
+├─ Cross-region: Daily (durable copy)
+├─ Archive: Monthly (7-year retention)
+└─ Total: ~$150/month for 500GB volume
+
+Rationale:
+├─ RPO: 1 hour (loose writes acceptable)
+├─ RTO: 10 minutes (quick restore)
+├─ Compliance: Historical data for audits
+└─ Cost justified by data criticality
+```
+
+### **Data Warehouse (st1 HDD, large throughput)**
+
+```
+Backup Schedule:
+├─ Snapshots: Daily (weekly granularity ok for analytics)
+├─ Retention: 30 days
+├─ Cross-region: Monthly (disaster recovery only)
+└─ Total: ~$30/month for 5TB volume
+
+Rationale:
+├─ RPO: 24 hours (acceptable for analytics)
+├─ RTO: 1 hour (restore from overnight snapshot)
+├─ Cost: HDD cheaper, less frequent snapshots
+└─ Workload: Historical data, not transactional
+```
+
+---
+
+## Summary: Redundancy vs Backups
+
+| Aspect | EBS Replication | EBS Snapshots |
+|--------|---|---|
+| **What it is** | 3x copies on different physical servers in same AZ | Point-in-time copy in S3 across AZs |
+| **Automatic** | Yes (transparent) | No (you configure) |
+| **Recovery time** | Milliseconds | Minutes to hours |
+| **Protects against** | Hardware failure | AZ failure, user error, data corruption |
+| **Cost** | Included in volume price | Extra ($0.05-$0.10 per GB-month) |
+| **Retention** | Current state only | Multiple snapshots (7 days to 7 years) |
+| **Scope** | Within single AZ | Across AZs and regions |
+
+**Production rule**: Use **both**:
+1. **EBS replication** (automatic) for hardware resilience
+2. **Snapshots** (manual/automated) for disaster recovery and compliance
+
+---
+
 ## Next Steps
 
 - Learn disk I/O monitoring (iostat, iotop, detailed latency analysis)
@@ -1080,3 +1581,5 @@ Why different filesystems?
 - Understand network bottlenecks (netstat, ss, iftop, packet loss)
 - Explore observability at scale (Prometheus, Grafana, distributed tracing)
 - Deep dive into EBS volume types and performance tuning (gp3 vs io2, IOPS provisioning)
+- Implement automated backup strategies (AWS Data Lifecycle Manager)
+- Design disaster recovery plans (RTO, RPO, failover procedures)
