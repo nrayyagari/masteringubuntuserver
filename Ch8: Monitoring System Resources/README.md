@@ -795,9 +795,288 @@ Yes, nginx workers consuming all CPU
 
 ---
 
+## AWS Storage Concepts: Disk, Volume, Partition, Formatting & Attachment
+
+### Understanding the Terminology
+
+When working in AWS (vs traditional Linux datacenters), storage layers differ. Here's the critical distinction:
+
+#### **Three Storage Layers**
+
+```
+Layer 1: Physical Storage (Hardware)
+  Traditional: /dev/sda (physical disk)
+  AWS: EBS volume (vol-0123456789) - network-attached block storage
+
+Layer 2: Logical Organization (Partitioning)
+  Traditional: /dev/sda1, /dev/sda2 (carving one disk into sections)
+  AWS: Not needed (whole volume = one logical unit)
+
+Layer 3: Mounted Filesystem (Accessible to OS)
+  Traditional: mount /dev/sda1 /data
+  AWS: mount /dev/nvme1n1 /data (same command)
+```
+
+**Key AWS reality**: Volume = Disk in traditional sense. AWS abstracts away partitioning because you just create multiple EBS volumes instead.
+
+---
+
+### What is a Root Volume?
+
+From AWS documentation: **"Each instance that you launch has an associated root volume, which is either an Amazon EBS volume or an instance store volume."**
+
+The **root volume** is the volume containing your operating system and boot files. It's automatically created and attached when you launch an EC2 instance.
+
+**Why "root"?**
+- In traditional Linux, `/` (root filesystem) lives on a specific disk
+- In AWS, that disk is called the "root volume"
+- It's the volume your OS boots from
+
+**Block Device Mapping** (AWS term): Configuration that specifies which volumes attach to an instance:
+```
+Example EC2 instance:
+├── /dev/nvme0n1 (30GB) → root volume, contains OS
+├── /dev/nvme1n1 (100GB) → additional data volume
+└── /dev/nvme2n1 (200GB) → additional backup volume
+```
+
+---
+
+### Volume vs Disk: Are They the Same?
+
+**In AWS: Yes**, essentially.
+
+From AWS documentation: **"An Amazon EBS volume is a durable, block-level storage device that you can attach to your instances. After you attach a volume to an instance, you can use it as you would use a physical hard drive."**
+
+| Aspect | Traditional Linux | AWS |
+|--------|---|---|
+| Physical storage | `/dev/sda` (direct hardware) | EBS `vol-0123456789` (network-attached) |
+| Terminology | Disk | Volume |
+| Partitioning | `fdisk /dev/sda` → `/dev/sda1`, `/dev/sda2` | Not needed (create separate volumes instead) |
+| Isolation | Partitions on same disk fail together | Volumes fail independently |
+
+**AWS Design Philosophy**: Instead of partitioning one disk, attach multiple independent volumes. Each can be scaled, backed up, or replaced separately.
+
+---
+
+### What Does "Attaching" Mean? (Critical AWS Concept)
+
+**Attaching ≠ Mounting. Two separate operations.**
+
+#### **Attaching (AWS Infrastructure Level)**
+
+```bash
+# AWS API operation (not OS-level)
+aws ec2 attach-volume \
+  --volume-id vol-0123456789 \
+  --instance-id i-abcd1234 \
+  --device /dev/sdf
+```
+
+From AWS documentation: **"The block device mapping is used by Amazon EC2 to specify the block devices to attach to an EC2 instance."**
+
+**What happens**:
+- AWS network-attaches the EBS volume to the EC2 instance
+- Volume becomes visible to OS as a block device (e.g., `/dev/nvme1n1`)
+- **But it's not yet usable** (like plugging in a USB drive that hasn't been mounted)
+
+#### **Mounting (OS Level)**
+
+```bash
+# Inside EC2 instance (SSH)
+# Step 1: Format if new volume
+sudo mkfs.ext4 /dev/nvme1n1
+
+# Step 2: Create mount point
+sudo mkdir /data
+
+# Step 3: Mount it
+sudo mount /dev/nvme1n1 /data
+```
+
+**What happens**:
+- OS reads filesystem structures
+- Creates a path (`/data`) to access the data
+- Now the volume is usable for reading/writing files
+
+---
+
+### Complete AWS Workflow vs Traditional Linux
+
+#### **Traditional Linux (Physical Disk)**
+```
+1. Physically insert disk into server
+2. Partition disk (optional): sudo fdisk /dev/sdb
+3. Format partition: sudo mkfs.ext4 /dev/sdb1
+4. Mount: sudo mount /dev/sdb1 /data
+```
+
+#### **AWS (EBS Volume)**
+```
+1. Create EBS volume (AWS API)
+   aws ec2 create-volume ...
+
+2. Attach to instance (AWS API) ← "Attaching"
+   aws ec2 attach-volume ...
+   (Volume visible as block device, not yet usable)
+
+3. Format (OS level, SSH into instance)
+   sudo mkfs.ext4 /dev/nvme1n1
+
+4. Mount (OS level, SSH into instance) ← "Mounting"
+   sudo mount /dev/nvme1n1 /data
+```
+
+**Key difference**: AWS adds step 1-2 (infrastructure API calls). Steps 3-4 are identical to traditional Linux.
+
+---
+
+### Real-World Example: Adding Storage to Running EC2 Instance
+
+```bash
+# Step 1: Create 100GB EBS volume (from AWS CLI on your local machine)
+$ aws ec2 create-volume \
+    --availability-zone us-east-1a \
+    --size 100 \
+    --volume-type gp3
+# Returns: vol-0987654321
+
+# Step 2: Attach to running instance
+$ aws ec2 attach-volume \
+    --volume-id vol-0987654321 \
+    --instance-id i-1234567890abcdef0 \
+    --device /dev/sdf
+
+# Step 3: SSH into instance and see what appeared
+$ ssh ec2-user@10.0.0.1
+instance$ lsblk
+# nvme0n1       259:0    0  30G  0 disk
+# └─nvme0n1p1   259:1    0  30G  0 part /
+# nvme1n1       259:1    0 100G  0 disk              ← Just attached, no partition below
+
+# Step 4: Format it with ext4
+instance$ sudo mkfs.ext4 /dev/nvme1n1
+# mke2fs 1.46.2 (28-Feb-2021)
+# Creating filesystem with 26214400 4k blocks...
+
+# Step 5: Create mount point
+instance$ sudo mkdir /data
+
+# Step 6: Mount it
+instance$ sudo mount /dev/nvme1n1 /data
+
+# Step 7: Verify it's mounted and usable
+instance$ df -h /data
+# Filesystem      Size  Used Avail Use% Mounted on
+# /dev/nvme1n1    100G   24K  100G   1% /data
+
+instance$ echo "test" > /data/file.txt  # Works!
+
+# Step 8: Make persistent (survives reboot)
+instance$ sudo echo "/dev/nvme1n1 /data ext4 defaults,nofail 0 2" >> /etc/fstab
+```
+
+---
+
+### Why Formatting Matters
+
+**Unformatted disk** (raw block device):
+```bash
+$ lsblk
+nvme1n1  259:1  0  100G  0  disk  ← Raw, unformatted
+
+$ ls /mnt/data  # If you try to access without formatting
+# ls: cannot access '/mnt/data': No such file or directory
+# (Nothing to mount, filesystem doesn't exist)
+```
+
+**Formatted disk** (with filesystem):
+```bash
+$ sudo mkfs.ext4 /dev/nvme1n1
+$ lsblk
+nvme1n1  259:1  0  100G  0  disk
+
+$ sudo mount /dev/nvme1n1 /mnt/data
+$ ls /mnt/data  # Now works, filesystem exists
+# lost+found/
+
+$ echo "data" > /mnt/data/file.txt
+# Success! Filesystem is usable
+```
+
+**What formatting does**:
+- Writes inode table (describes where files are)
+- Creates root directory
+- Sets up block allocation map
+- Initializes filesystem metadata (ext4, XFS, btrfs, etc.)
+
+---
+
+### Multiple Filesystems on One Disk?
+
+**Technically possible but rare**:
+
+```
+Traditional Linux: Partition one disk into multiple filesystems
+/dev/sda (1TB disk)
+├── /dev/sda1 (400GB, ext4) → /data
+├── /dev/sda2 (300GB, btrfs) → /backup
+└── /dev/sda3 (300GB, xfs) → /archive
+
+AWS: Just create separate volumes (cleaner)
+EC2 instance
+├── /dev/nvme1n1 (400GB, ext4) → /data
+├── /dev/nvme2n1 (300GB, btrfs) → /backup
+└── /dev/nvme3n1 (300GB, xfs) → /archive
+```
+
+**Why AWS approach is better**:
+- Volumes fail independently (one EBS failure doesn't cascade)
+- Dynamic scaling (resize/detach/replace without repartitioning)
+- Cleaner operational model
+- Volumes can be backed up separately
+
+---
+
+### Key AWS Differences Summary
+
+| Concept | Traditional | AWS |
+|---------|---|---|
+| Physical storage unit | `/dev/sda` (disk) | EBS `vol-123` (volume) |
+| Partitioning | `fdisk` to create `/dev/sda1`, `/dev/sda2` | Not needed; create multiple volumes |
+| Attachment | Physical insertion into server | `attach-volume` API call |
+| Device naming | `/dev/sda`, `/dev/sdb` | `/dev/nvme1n1`, `/dev/nvme2n1` (NVMe) |
+| Mounting | `mount /dev/sda1 /data` | `mount /dev/nvme1n1 /data` (same) |
+| Failure domain | Partitions on same disk fail together | Each volume independent |
+| Scaling | Requires repartitioning (dangerous) | Detach old, attach new volume |
+
+---
+
+### Real-World Scenario: Different Filesystems for Different Workloads
+
+```
+Production database server:
+├── Root volume (/dev/nvme0n1, 30GB, ext4)
+│   └─ OS and system files
+│
+├── Data volume (/dev/nvme1n1, 500GB, XFS)
+│   └─ PostgreSQL database (XFS optimized for IOPS)
+│
+└── Backup volume (/dev/nvme2n1, 2TB, btrfs)
+    └─ Snapshots and backups (btrfs compression + snapshots)
+
+Why different filesystems?
+- XFS: High-performance for database random I/O
+- btrfs: Snapshots + compression for backup efficiency
+- ext4: Simple and reliable for OS
+```
+
+---
+
 ## Next Steps
 
 - Learn disk I/O monitoring (iostat, iotop, detailed latency analysis)
 - Master memory management (OOM killer, memory pressure, mmap behavior)
 - Understand network bottlenecks (netstat, ss, iftop, packet loss)
 - Explore observability at scale (Prometheus, Grafana, distributed tracing)
+- Deep dive into EBS volume types and performance tuning (gp3 vs io2, IOPS provisioning)
